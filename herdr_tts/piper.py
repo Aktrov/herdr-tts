@@ -6,6 +6,7 @@ Managed layout, under the plugin config dir:
     voices/<name>.onnx  + .onnx.json
 """
 
+import json
 import os
 import platform
 import shutil
@@ -114,6 +115,15 @@ def voice_onnx(config_dir, voice):
     return p if p.exists() else None
 
 
+def voice_sample_rate(onnx_path, default=22050):
+    """Sample rate from the voice's <name>.onnx.json, for raw playback."""
+    try:
+        meta = json.loads(Path(str(onnx_path) + ".json").read_text())
+        return int(meta.get("audio", {}).get("sample_rate", default)) or default
+    except (OSError, ValueError, TypeError):
+        return default
+
+
 def ensure_voice(config_dir, voice, note=print):
     p = voice_onnx(config_dir, voice)
     if p:
@@ -152,4 +162,4 @@ def synth(binary, voice_file, text, out_wav, length_scale=0.0):
 
 
 __all__ = ["PiperError", "piper_bin", "ensure_piper", "voice_onnx",
-           "ensure_voice", "synth", "PIPER_RELEASE"]
+           "voice_sample_rate", "ensure_voice", "synth", "PIPER_RELEASE"]

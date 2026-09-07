@@ -5,4 +5,6 @@ vendor/
 samples/*.wav
 *.log
 play.pid
+synth.pid
+speak.lock
 spool.jsonl

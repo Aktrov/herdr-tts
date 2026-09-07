@@ -1,11 +1,15 @@
-"""Playback: pick a player, play a WAV file, remember its PID so `stop` can
-kill it, and dispatch the configured engine (piper / spd-say / command).
+"""Playback: dispatch the configured engine, stream Piper straight to the
+player so long text starts speaking fast, and make sure only one utterance
+runs at a time.
 
 Audio comes out of the machine running the Herdr server.
 """
 
+import contextlib
+import fcntl
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -16,9 +20,9 @@ from pathlib import Path
 from . import piper as piper_mod
 from .log import log
 
-# File players — handed a real .wav path (piping a 22 kHz WAV into a player that
-# assumes 48 kHz is what makes it sound fast/chipmunk).
-_PLAYERS = [
+# File players — given a real .wav path (a headerless stream into a player that
+# assumes 48 kHz is what makes it sound chipmunk).
+_FILE_PLAYERS = [
     ["paplay"],
     ["pw-play"],
     ["ffplay", "-hide_banner", "-loglevel", "error", "-autoexit", "-nodisp"],
@@ -40,55 +44,95 @@ def toast(text):
         pass
 
 
-def _detect_player():
-    for cand in _PLAYERS:
+# ---- single-instance lock + pid tracking ------------------------------------
+
+@contextlib.contextmanager
+def _lock(state_dir, timeout=20.0):
+    """Exclusive lock so two `speak` invocations can't spawn overlapping audio.
+    On timeout, proceed anyway (a dropped request is worse than a rare overlap)."""
+    path = Path(state_dir) / "speak.lock"
+    fh = open(path, "a+")
+    deadline = time.monotonic() + timeout
+    got = False
+    try:
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                got = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    log(state_dir, "speak.lock: timeout, proceeding without it")
+                    break
+                time.sleep(0.1)
+        yield
+    finally:
+        if got:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        fh.close()
+
+
+def _pidf(state_dir, name):
+    return Path(state_dir) / name
+
+
+def _record_pgid(state_dir, name, pid):
+    try:
+        _pidf(state_dir, name).write_text(str(os.getpgid(pid)))
+    except (ProcessLookupError, OSError):
+        pass
+
+
+def _kill(state_dir, name):
+    pf = _pidf(state_dir, name)
+    try:
+        pgid = int(pf.read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return False
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError):
+            break
+        time.sleep(0.1)
+    pf.unlink(missing_ok=True)
+    return True
+
+
+def stop(state_dir, engine="piper"):
+    killed = _kill(state_dir, "play.pid") | _kill(state_dir, "synth.pid")
+    log(state_dir, "stop: killed running audio" if killed else "stop: nothing running")
+    if engine == "spd-say" and shutil.which("spd-say"):
+        subprocess.run(["spd-say", "-C"], check=False)
+
+
+# ---- players ---------------------------------------------------------------
+
+def _file_player():
+    for cand in _FILE_PLAYERS:
         if shutil.which(cand[0]):
             return cand
     return None
 
 
-def _pidfile(state_dir):
-    return Path(state_dir) / "play.pid"
+def _raw_player(sample_rate):
+    """A player that takes raw s16le mono on stdin — lets us stream Piper."""
+    sr = int(sample_rate or 22050)
+    if shutil.which("pw-play"):
+        return ["pw-play", f"--rate={sr}", "--channels=1", "--format=s16", "-"]
+    if shutil.which("paplay"):
+        return ["paplay", "--raw", f"--rate={sr}", "--channels=1", "--format=s16le"]
+    if shutil.which("aplay"):
+        return ["aplay", "-q", "-t", "raw", "-f", "S16_LE", f"-r{sr}", "-c1", "-"]
+    if shutil.which("ffplay"):
+        return ["ffplay", "-hide_banner", "-loglevel", "error", "-autoexit",
+                "-nodisp", "-f", "s16le", "-ar", str(sr), "-ac", "1", "-i", "-"]
+    return None
 
 
-def _kill_pgid(pgid):
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-        time.sleep(0.15)
-        os.killpg(pgid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
-
-
-def stop(state_dir, engine="piper"):
-    pf = _pidfile(state_dir)
-    try:
-        pgid = int(pf.read_text().strip())
-        _kill_pgid(pgid)
-        pf.unlink(missing_ok=True)
-        log(state_dir, "stop: killed playback")
-    except (FileNotFoundError, ValueError):
-        log(state_dir, "stop: nothing playing")
-    if engine == "spd-say" and shutil.which("spd-say"):
-        subprocess.run(["spd-say", "-C"], check=False)
-
-
-def _play_file(state_dir, wav):
-    player = _detect_player()
-    if not player:
-        return False
-    proc = subprocess.Popen(player + [str(wav)],
-                            stdin=subprocess.DEVNULL,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            start_new_session=True)
-    _pidfile(state_dir).write_text(str(os.getpgid(proc.pid)))
-    return True
-
+# ---- spool (remote handoff) ---------------------------------------------
 
 def queue_clipboard(state_dir):
-    """Queue a 'speak' with no text — the companion reads its own (client)
-    clipboard. Used when the plugin runs on a remote server and a keybinding
-    didn't carry the selection."""
     _spool(state_dir, "", from_clipboard=True)
 
 
@@ -113,28 +157,51 @@ def _cache_dir(state_dir):
     return d
 
 
+# ---- entry point -------------------------------------------------------
+
 def speak_text(config, config_dir, state_dir, text):
-    """Synthesize + play `text`. Interrupts any current playback first."""
+    """Synthesize + play `text`, interrupting anything already running."""
     state_dir = Path(state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
     engine = config.get("engine", "piper")
-    stop(state_dir, engine)
 
-    if engine == "command":
-        return _speak_command(config, state_dir, text)
-    if engine == "spd-say":
-        return _speak_spd(state_dir, text)
-    if engine == "spool":
-        _spool(state_dir, text)
-        log(state_dir, f"speak: queued to spool ({len(text)} chars)")
-        return "spool"
-    return _speak_piper(config, config_dir, state_dir, text)
+    stop(state_dir, engine)                 # preempt fast, before we queue for the lock
+    with _lock(state_dir):
+        stop(state_dir, engine)             # and kill anything a racer just started
+        if engine == "command":
+            return _speak_command(config, state_dir, text)
+        if engine == "spd-say":
+            return _speak_spd(state_dir, text)
+        if engine == "spool":
+            _spool(state_dir, text)
+            log(state_dir, f"speak: queued to spool ({len(text)} chars)")
+            return "spool"
+        return _speak_piper(config, config_dir, state_dir, text)
+
+
+# ---- engines --------------------------------------------------------------
+
+def _piper_cmd(binary, voice, length_scale):
+    cmd = [str(binary), "--model", str(voice)]
+    if length_scale and length_scale > 0:
+        cmd += ["--length_scale", str(length_scale)]
+    espeak = Path(binary).parent / "espeak-ng-data"
+    if espeak.is_dir():
+        cmd += ["--espeak_data", str(espeak)]
+    return cmd
+
+
+def _piper_env(binary):
+    env = dict(os.environ)
+    env["LD_LIBRARY_PATH"] = (str(Path(binary).parent) + os.pathsep
+                              + env.get("LD_LIBRARY_PATH", ""))
+    return env
 
 
 def _speak_piper(config, config_dir, state_dir, text):
-    have_bin = piper_mod.piper_bin(config_dir, config.get("piper_bin", "")) is not None
-    have_voice = piper_mod.voice_onnx(config_dir, config.get("voice", "en_US-ryan-high")) is not None
-    if not (have_bin and have_voice):
+    have = (piper_mod.piper_bin(config_dir, config.get("piper_bin", "")) is not None
+            and piper_mod.voice_onnx(config_dir, config.get("voice", "en_US-ryan-high")) is not None)
+    if not have:
         toast("herdr-tts: downloading Piper voice (first run)…")
     try:
         binary = piper_mod.ensure_piper(config_dir, config.get("piper_bin", ""),
@@ -149,33 +216,62 @@ def _speak_piper(config, config_dir, state_dir, text):
         toast(f"herdr-tts: {e}")
         return "error"
 
+    ls = config.get("length_scale", 0.0)
+    pcmd = _piper_cmd(binary, voice, ls)
+    env = _piper_env(binary)
+
+    # Streaming: Piper -> raw player in one pipeline. Playback starts on the
+    # first audio chunk, so a long paragraph doesn't sit silent while it
+    # synthesizes the whole thing.
+    raw = _raw_player(piper_mod.voice_sample_rate(voice))
+    if raw:
+        pipeline = shlex.join(pcmd + ["--output-raw"]) + " | " + shlex.join(raw)
+        proc = subprocess.Popen(["sh", "-c", pipeline], stdin=subprocess.PIPE,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True, env=env)
+        try:
+            proc.stdin.write(text.encode("utf-8", "replace"))
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
+        _record_pgid(state_dir, "play.pid", proc.pid)
+        log(state_dir, f"speak: piper (stream), {len(text)} chars")
+        return "piper"
+
+    # No raw-capable player: synth to a file, then play it.
+    player = _file_player()
+    if not player:
+        if config.get("spool_fallback", True):
+            _spool(state_dir, text)
+            log(state_dir, f"speak: no player — queued to spool ({len(text)} chars)")
+            return "spool"
+        toast("herdr-tts: no audio player found")
+        return "error"
     wav = _cache_dir(state_dir) / f"u-{int(time.time()*1000)}.wav"
-    try:
-        piper_mod.synth(binary, voice, text, wav, config.get("length_scale", 0.0))
-    except piper_mod.PiperError as e:
-        log(state_dir, str(e))
+    synth = subprocess.Popen(pcmd + ["--output_file", str(wav)],
+                             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.PIPE, start_new_session=True, env=env)
+    _record_pgid(state_dir, "synth.pid", synth.pid)
+    _, err = synth.communicate(text.encode("utf-8", "replace"), timeout=180)
+    _pidf(state_dir, "synth.pid").unlink(missing_ok=True)
+    if synth.returncode != 0 or not wav.exists() or wav.stat().st_size < 64:
+        log(state_dir, "piper synth failed: " + err.decode("utf-8", "replace")[:200])
         toast("herdr-tts: synthesis failed")
         return "error"
-
-    if _play_file(state_dir, wav):
-        log(state_dir, f"speak: piper, {len(text)} chars")
-        return "piper"
-    # No audio device here (headless server) — hand off to the companion.
-    if config.get("spool_fallback", True):
-        _spool(state_dir, text)
-        log(state_dir, f"speak: no player — queued to spool ({len(text)} chars)")
-        return "spool"
-    toast("herdr-tts: no audio player found")
-    return "error"
+    proc = subprocess.Popen(player + [str(wav)], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            start_new_session=True)
+    _record_pgid(state_dir, "play.pid", proc.pid)
+    log(state_dir, f"speak: piper (file), {len(text)} chars")
+    return "piper"
 
 
 def _speak_spd(state_dir, text):
     if not shutil.which("spd-say"):
         toast("herdr-tts: spd-say not installed")
         return "error"
-    proc = subprocess.Popen(["spd-say", "-e", "-w", "--", text],
-                            start_new_session=True)
-    _pidfile(state_dir).write_text(str(os.getpgid(proc.pid)))
+    proc = subprocess.Popen(["spd-say", "-e", "-w", "--", text], start_new_session=True)
+    _record_pgid(state_dir, "play.pid", proc.pid)
     log(state_dir, f"speak: spd-say, {len(text)} chars")
     return "spd-say"
 
@@ -187,8 +283,7 @@ def _speak_command(config, state_dir, text):
         return "error"
     uses_ph = any("{text}" in a for a in argv)
     cmd = [a.replace("{text}", text) for a in argv]
-    proc = subprocess.Popen(cmd,
-                            stdin=None if uses_ph else subprocess.PIPE,
+    proc = subprocess.Popen(cmd, stdin=None if uses_ph else subprocess.PIPE,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             start_new_session=True)
     if not uses_ph:
@@ -197,7 +292,7 @@ def _speak_command(config, state_dir, text):
             proc.stdin.close()
         except BrokenPipeError:
             pass
-    _pidfile(state_dir).write_text(str(os.getpgid(proc.pid)))
+    _record_pgid(state_dir, "play.pid", proc.pid)
     log(state_dir, f"speak: command {cmd[0]}, {len(text)} chars")
     return "command"
 

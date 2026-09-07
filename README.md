@@ -69,6 +69,11 @@ optional:
 Voices: <https://huggingface.co/rhasspy/piper-voices>. Try a few with
 `tools/gen-samples.sh <name>...`.
 
+**Playback:** Piper is streamed straight into the player (`pw-play` / `paplay` /
+`aplay` / `ffplay`), so long passages start speaking right away instead of
+waiting for the whole synthesis. An exclusive lock in the plugin state dir
+means a new `speak` always interrupts the previous one — no overlapping audio.
+
 ## Actions
 
 | action | id |
@@ -105,7 +110,8 @@ machine's config by default, or attach with `--remote-keybindings server`.
 |---|---|
 | Nothing happens | `tts.log` in the plugin state dir (`herdr plugin config-dir …` → sibling `../../../state/herdr/plugins/<id>/`), or `herdr plugin log list --plugin aktrov.herdr-tts` |
 | Robotic voice | `engine` fell back to `spd-say` — open the setup pane to finish the Piper download |
-| Fast / chipmunk | a custom `player` is piping instead of taking a file path |
+| Fast / chipmunk | wrong sample rate — check the voice's `.onnx.json` `audio.sample_rate`; a custom raw `player` needs matching `--rate` |
+| Two voices at once | shouldn't happen (state-dir lock); if it does, delete stale `play.pid` / `synth.pid` in the state dir |
 | `prefix+t` does nothing | keybinding is on the wrong machine — see [Use](#use) / [Remote](#remote-herdr---remote) |
 | `prefix+t` speaks stale text | it reads the clipboard; re-select (with `copy_on_select` on, that refreshes it) |
 
@@ -119,7 +125,7 @@ herdr_tts/
   paths.py            config/state dir resolution
   config.py           defaults + TOML load (tomllib, tiny fallback < 3.11)
   piper.py            locate/download Piper + voice, synth to WAV
-  speech.py           engine dispatch, player detection, play, stop, spool
+  speech.py           engine dispatch, streaming playback, single-instance lock, stop, spool
   selection.py        selected_text -> clipboard -> ""
   log.py              rotating log
 companion/            client-side listener for `herdr --remote` (WIP)
