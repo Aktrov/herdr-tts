@@ -1,0 +1,22 @@
+# herdr-tts keybindings — append to ~/.config/herdr/config.toml.
+#
+# Put this on the machine running the herdr *client*:
+#   - `ssh <host>` + `herdr`   -> that host's config
+#   - `herdr --remote <host>`  -> the LOCAL machine's config (keybindings=local
+#                                 by default), or attach with
+#                                 `--remote-keybindings server` to use the host's.
+#
+# [[keys.command]] is an absolute TOML path — valid at the end of the file.
+# Apply with: herdr server reload-config, or prefix+shift+r, or re-attach.
+
+[[keys.command]]
+key = "prefix+t"
+type = "plugin_action"
+command = "aktrov.herdr-tts.speak"
+description = "TTS: speak selection"
+
+[[keys.command]]
+key = "prefix+shift+s"
+type = "plugin_action"
+command = "aktrov.herdr-tts.stop"
+description = "TTS: stop speaking"

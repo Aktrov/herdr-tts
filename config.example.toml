@@ -1,0 +1,32 @@
+# herdr-tts settings. Copy to the plugin config directory as config.toml:
+#   herdr plugin config-dir aktrov.herdr-tts
+# Every key is optional; defaults are shown.
+
+# Voice backend.
+#   "piper"    neural, offline, natural (default)
+#   "spd-say"  robotic system TTS — the fallback when Piper isn't set up
+#   "command"  run speak_command (route audio elsewhere, e.g. over SSH)
+engine = "piper"
+
+# Piper voice: a name that setup can download, or an absolute path to a .onnx.
+# Browse: https://huggingface.co/rhasspy/piper-voices
+voice = "en_US-ryan-high"
+
+# Speech rate. 0 = the voice's own default. >1 slower, <1 faster (try 0.9-1.2).
+length_scale = 0.0
+
+# Longer selections are truncated to this many characters.
+max_chars = 4000
+
+# Leave blank to use the managed copy in this config dir (or `piper` on PATH).
+# piper_bin = ""
+
+# engine = "command": argv that speaks the text. If an argument contains {text}
+# it's substituted; otherwise the text is piped to stdin. Use it to play audio
+# somewhere you can actually hear it when the herdr server is remote:
+# speak_command = ["ssh", "my-laptop", "spd-say"]
+# speak_command = ["ssh", "my-mac", "say"]
+
+# When Piper can't play locally (headless server), append the utterance to
+# spool.jsonl in the plugin state dir for the companion listener to pick up.
+spool_fallback = true

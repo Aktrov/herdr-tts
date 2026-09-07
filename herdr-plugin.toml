@@ -1,0 +1,49 @@
+# herdr-tts — speak the selected terminal text in a natural neural voice (Piper).
+#
+# Audio plays on the machine running the Herdr server. With a local `herdr`
+# that's your machine, so this works out of the box. With `herdr --remote` the
+# server is elsewhere; see companion/ for the client-side listener, or set
+# `speak_command` in config.toml to route audio over SSH.
+#
+# Install:   herdr plugin install Aktrov/herdr-tts
+# Local dev: herdr plugin link /path/to/herdr-tts
+# Config:    herdr plugin config-dir aktrov.herdr-tts   ->   put config.toml there
+
+id = "aktrov.herdr-tts"
+name = "Herdr TTS"
+version = "0.2.0"
+min_herdr_version = "0.8.0"
+description = "Speak the selected text (or clipboard) aloud in a natural neural voice — local Piper, spd-say, or any custom command"
+platforms = ["linux", "macos"]
+
+# Runs once at install (after confirmation). Downloads the Piper binary + the
+# default voice into the plugin config dir. Exits 0 even if offline so install
+# still completes — rerun via the "Herdr TTS setup" pane.
+[[build]]
+command = ["python3", "bin/setup.py", "--fetch"]
+
+[[actions]]
+id = "speak"
+title = "Speak selection"
+description = "Speak the selected text (falls back to the clipboard for keybindings)"
+contexts = ["selection", "global"]
+command = ["python3", "bin/tts.py", "speak"]
+
+[[actions]]
+id = "stop"
+title = "Stop speaking"
+description = "Stop the current playback"
+contexts = ["global"]
+command = ["python3", "bin/tts.py", "stop"]
+
+[[actions]]
+id = "test"
+title = "Test TTS voice"
+contexts = ["workspace"]
+command = ["python3", "bin/tts.py", "test"]
+
+[[panes]]
+id = "setup"
+title = "Herdr TTS setup"
+placement = "split"
+command = ["python3", "bin/setup.py"]

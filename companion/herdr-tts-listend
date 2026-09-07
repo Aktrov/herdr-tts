@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""herdr-tts listener — runs on the CLIENT machine (your laptop).
+
+Tails the herdr-tts spool file on the herdr server over SSH and speaks each
+queued selection locally with Piper. A new "speak" record interrupts whatever is
+currently playing; a "stop" record just interrupts.
+
+    ssh <host> -- tail -n0 -F <remote spool>   ->   piper --model <voice>   ->   player
+
+Config: ~/.config/herdr-tts/config.json  (see config.example.json). CLI flags win.
+Runs in the foreground; wrap it in the systemd --user unit for always-on.
+"""
+
+import argparse
+import json
+import os
+import queue
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from collections import deque
+from pathlib import Path
+
+CONFIG_PATH = Path(
+    os.environ.get("HERDR_TTS_CONFIG",
+                   os.path.expanduser("~/.config/herdr-tts/config.json"))
+)
+
+DEFAULTS = {
+    "ssh_host": "my-herdr-host",              # "" / null / "local" = herdr runs on THIS
+                                     # machine; tail the spool directly, no SSH
+    "remote_spool": "~/.local/state/herdr/plugins/aktrov.herdr-tts/spool.jsonl",
+    "ssh_opts": ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                 "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"],
+    "tail_cmd": None,                  # advanced: full argv that streams spool lines
+                                      # to stdout; overrides the ssh+tail default
+    "engine": "piper",                 # piper | spd-say | command
+    "piper_bin": "~/.local/share/herdr-tts/piper/piper",
+    "piper_voice": "~/.local/share/herdr-tts/voices/en_US-ryan-high.onnx",
+    "piper_length_scale": None,        # None = voice default; >1 slower, <1 faster
+    "player": "auto",                  # auto | argv list; the WAV path is appended
+    "synth_cmd": None,                 # engine=command: argv, text on stdin, audio on stdout
+    "clipboard_cmd": "auto",           # auto | argv that prints the clipboard to stdout
+    "max_chars": 4000,
+    "stale_after_seconds": 90,
+}
+
+# Read the local clipboard when a "speak" record has no text (herdr keybindings
+# don't carry the selection; copy_on_select keeps the clipboard = last selection).
+CLIPBOARD_CANDIDATES = [
+    ["wl-paste", "--no-newline"],
+    ["xclip", "-selection", "clipboard", "-o"],
+    ["xsel", "--clipboard", "--output"],
+    ["pbpaste"],
+]
+
+# Players are handed a real .wav FILE path (appended as the last arg), never a
+# pipe — piping a 22.05 kHz WAV into a player that assumes 48 kHz raw is what
+# makes it sound fast/chipmunk. A file lets every player read the real header.
+PLAYER_CANDIDATES = [
+    ["paplay"],
+    ["pw-play"],
+    ["ffplay", "-hide_banner", "-loglevel", "error", "-autoexit", "-nodisp"],
+    ["aplay", "-q"],
+    ["mpv", "--no-video", "--really-quiet"],
+]
+
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME",
+                                os.path.expanduser("~/.cache"))) / "herdr-tts"
+
+
+def log(*a):
+    print(time.strftime("%H:%M:%S"), *a, file=sys.stderr, flush=True)
+
+
+def load_config(cli_path=None):
+    cfg = dict(DEFAULTS)
+    path = Path(cli_path).expanduser() if cli_path else CONFIG_PATH
+    if path.is_file():
+        try:
+            cfg.update(json.loads(path.read_text()))
+            log(f"config: {path}")
+        except (json.JSONDecodeError, OSError) as e:
+            log(f"config: ignoring {path}: {e}")
+    else:
+        log(f"config: {path} not found, using defaults")
+    return cfg
+
+
+def expand(p):
+    return os.path.expanduser(p) if isinstance(p, str) else p
+
+
+def detect_player(cfg):
+    p = cfg.get("player")
+    if isinstance(p, list):
+        return p
+    if isinstance(p, str) and p != "auto":
+        return p.split()
+    for cand in PLAYER_CANDIDATES:
+        if shutil.which(cand[0]):
+            return cand
+    return None
+
+
+def detect_clipboard(cfg):
+    c = cfg.get("clipboard_cmd")
+    if isinstance(c, list):
+        return c
+    if isinstance(c, str) and c != "auto":
+        return c.split()
+    on_wayland = bool(os.environ.get("WAYLAND_DISPLAY"))
+    cands = CLIPBOARD_CANDIDATES if on_wayland else CLIPBOARD_CANDIDATES[1:] + CLIPBOARD_CANDIDATES[:1]
+    for cand in cands:
+        if shutil.which(cand[0]):
+            return cand
+    return None
+
+
+def read_clipboard(cmd):
+    if not cmd:
+        log("no clipboard tool found — install wl-clipboard (Wayland) or xclip/xsel (X11)")
+        return ""
+    try:
+        out = subprocess.run(cmd, capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"clipboard read failed ({cmd[0]}): {e}")
+        return ""
+    return out.stdout.decode("utf-8", "replace")
+
+
+class Speaker:
+    """Synthesizes to a temp .wav, then plays that file. At most one utterance
+    (a synth process, then a player process) is live at a time; stop() kills it."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.procs = []          # live Popen objects (synth and/or player)
+        self.engine = cfg["engine"]
+        self.player = detect_player(cfg)
+        self.clipboard = detect_clipboard(cfg)
+        self._tmpfiles = []
+        if self.engine in ("piper", "command") and not self.player:
+            log("WARNING: no audio player found (tried "
+                + ", ".join(c[0] for c in PLAYER_CANDIDATES) + ")")
+        try:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            for old in CACHE_DIR.glob("u-*.wav"):
+                old.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    # -- lifecycle ---------------------------------------------------------
+    def stop(self):
+        for pr in self.procs:
+            if pr.poll() is None:
+                try:
+                    os.killpg(os.getpgid(pr.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        self.procs = []
+        if self.engine == "spd-say" and shutil.which("spd-say"):
+            subprocess.run(["spd-say", "-C"], check=False)
+        self._reap_tmpfiles()
+
+    def _reap_tmpfiles(self):
+        for f in self._tmpfiles[:]:
+            try:
+                os.unlink(f)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                continue
+            self._tmpfiles.remove(f)
+
+    def speak(self, text):
+        self.stop()
+        text = text.strip()
+        if not text:
+            return
+        maxc = int(self.cfg.get("max_chars") or 0)
+        if maxc and len(text) > maxc:
+            text = text[:maxc].rsplit(" ", 1)[0] + " . . . text truncated."
+            log(f"truncated to {len(text)} chars")
+
+        if self.engine == "spd-say":
+            self._spd_say(text)
+        elif self.engine == "command":
+            self._command(text)
+        else:
+            self._piper(text)
+
+    # -- engines ---------------------------------------------------------
+    def _new_wav(self):
+        return str(CACHE_DIR / f"u-{os.getpid()}-{int(time.time() * 1000)}.wav")
+
+    def _piper(self, text):
+        pbin = expand(self.cfg["piper_bin"])
+        voice = expand(self.cfg["piper_voice"])
+        if not (os.path.exists(pbin) and os.path.exists(voice)):
+            log(f"piper missing: bin={pbin} voice={voice} — run setup-laptop.sh")
+            return
+        if not self.player:
+            return
+        wav = self._new_wav()
+        cmd = [pbin, "--model", voice, "--output_file", wav]
+        ls = self.cfg.get("piper_length_scale")
+        if ls is not None:
+            cmd += ["--length_scale", str(ls)]
+        espeak_data = os.path.join(os.path.dirname(pbin), "espeak-ng-data")
+        if os.path.isdir(espeak_data):
+            cmd += ["--espeak_data", espeak_data]
+        env = dict(os.environ)
+        env["LD_LIBRARY_PATH"] = (os.path.dirname(pbin) + os.pathsep
+                                  + env.get("LD_LIBRARY_PATH", ""))
+        synth = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.PIPE,
+                                 start_new_session=True, env=env)
+        self.procs = [synth]
+        try:
+            _, err = synth.communicate(text.encode("utf-8", "replace"), timeout=120)
+        except subprocess.TimeoutExpired:
+            self.stop()
+            log("piper timed out")
+            return
+        if synth.returncode != 0 or not os.path.exists(wav) or os.path.getsize(wav) < 64:
+            log(f"piper failed rc={synth.returncode}: "
+                f"{(err or b'').decode('utf-8', 'replace')[:200]}")
+            return
+        self._play_file(wav)
+
+    def _command(self, text):
+        synth = self.cfg.get("synth_cmd")
+        if not synth:
+            log("engine=command but synth_cmd is not set")
+            return
+        wav = self._new_wav()
+        with open(wav, "wb") as out:
+            p1 = subprocess.Popen(list(synth), stdin=subprocess.PIPE, stdout=out,
+                                  stderr=subprocess.DEVNULL, start_new_session=True)
+            self.procs = [p1]
+            try:
+                p1.communicate(text.encode("utf-8", "replace"), timeout=120)
+            except subprocess.TimeoutExpired:
+                self.stop()
+                log("synth_cmd timed out")
+                return
+        if p1.returncode == 0 and os.path.getsize(wav) > 64:
+            self._play_file(wav)
+        else:
+            log(f"synth_cmd failed rc={p1.returncode}")
+
+    def _play_file(self, wav):
+        if not self.player:
+            return
+        self._tmpfiles.append(wav)
+        pr = subprocess.Popen(self.player + [wav],
+                              stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              start_new_session=True)
+        self.procs = [pr]
+
+    def _spd_say(self, text):
+        pr = subprocess.Popen(["spd-say", "-w", "-e", "--", text],
+                              start_new_session=True)
+        self.procs = [pr]
+
+
+def is_local(cfg):
+    host = (cfg.get("ssh_host") or "").strip().lower()
+    return host in ("", "local", "localhost", "127.0.0.1")
+
+
+def remote_tail_cmd(cfg):
+    if cfg.get("tail_cmd"):
+        return list(cfg["tail_cmd"])
+    if is_local(cfg):
+        return ["tail", "-n0", "-F", expand(cfg["remote_spool"])]
+    spool = cfg["remote_spool"]
+    # keep ~ literal so the remote login shell expands it
+    return ["ssh", *cfg["ssh_opts"], cfg["ssh_host"], "--",
+            f"tail -n0 -F {spool}"]
+
+
+def run(cfg):
+    speaker = Speaker(cfg)
+    stopping = {"v": False}
+
+    def handle(signum, _frame):
+        stopping["v"] = True
+        speaker.stop()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGINT, handle)
+    signal.signal(signal.SIGTERM, handle)
+
+    backoff = 2
+    while not stopping["v"]:
+        cmd = remote_tail_cmd(cfg)
+        log("connect:", " ".join(cmd))
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True)
+        except OSError as e:
+            log("ssh spawn failed:", e)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+            continue
+
+        for line in proc.stdout:
+            backoff = 2
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                log("bad spool line:", line[:120])
+                continue
+            cmd_ = rec.get("cmd")
+            age = time.time() - float(rec.get("t", 0) or 0)
+            if cmd_ == "stop":
+                log("stop")
+                speaker.stop()
+            elif cmd_ == "speak":
+                stale = age > float(cfg["stale_after_seconds"])
+                txt = rec.get("text", "") or ""
+                src = "context"
+                if not txt and rec.get("from_clipboard"):
+                    txt = read_clipboard(speaker.clipboard).strip()
+                    src = f"clipboard/{speaker.clipboard[0] if speaker.clipboard else 'none'}"
+                log(f"speak ({len(txt)} chars, {src}, age {age:.1f}s)"
+                    + (" — stale, ignored" if stale else "")
+                    + (" — empty, skipped" if not txt and not stale else ""))
+                if not stale and txt:
+                    speaker.speak(txt)
+
+        err = (proc.stderr.read() or "").strip()
+        proc.wait()
+        if stopping["v"]:
+            break
+        log(f"ssh ended (rc={proc.returncode}){': ' + err if err else ''}; "
+            f"retry in {backoff}s")
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 30)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-c", "--config", help="path to config.json")
+    ap.add_argument("--host", help="override ssh_host")
+    ap.add_argument("--engine", choices=["piper", "spd-say", "command"])
+    ap.add_argument("--print-config", action="store_true",
+                    help="show the effective config and exit")
+    ap.add_argument("--test", metavar="TEXT",
+                    help="speak TEXT once locally and exit (no SSH)")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    if args.host:
+        cfg["ssh_host"] = args.host
+    if args.engine:
+        cfg["engine"] = args.engine
+
+    if args.print_config:
+        print(json.dumps(cfg, indent=2))
+        return
+    if args.test is not None:
+        sp = Speaker(cfg)
+        sp.speak(args.test)
+        for pr in sp.procs:
+            pr.wait()
+        sp._reap_tmpfiles()
+        return
+
+    run(cfg)
+
+
+if __name__ == "__main__":
+    main()

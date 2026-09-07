@@ -1,0 +1,24 @@
+{
+  "ssh_host": "my-herdr-host",
+  "remote_spool": "~/.local/state/herdr/plugins/aktrov.herdr-tts/spool.jsonl",
+
+  "engine": "piper",
+  "piper_bin": "~/.local/share/herdr-tts/piper/piper",
+  "piper_voice": "~/.local/share/herdr-tts/voices/en_US-ryan-high.onnx",
+  "piper_length_scale": null,
+
+  "player": "auto",
+  "clipboard_cmd": "auto",
+  "max_chars": 4000,
+  "stale_after_seconds": 90,
+
+  "_notes": {
+    "engine": "piper | spd-say | command",
+    "piper_length_scale": "null = voice default; 1.15 slower, 0.9 faster",
+    "player": "\"auto\" tries paplay, pw-play, ffplay, aplay, mpv. Or give an argv list; the .wav file path is appended as the last arg, e.g. [\"mpv\", \"--no-video\", \"--really-quiet\"]",
+    "clipboard_cmd": "\"auto\" tries wl-paste / xclip / xsel / pbpaste. Used only when a keybound speak arrives with no text (herdr doesn't pass the selection to keybindings; copy_on_select keeps the clipboard = last selection). Or an argv list that prints the clipboard to stdout.",
+    "synth_cmd": "engine=command only: argv that takes text on stdin and writes a WAV to stdout; it's captured to a temp file and played with `player`",
+    "ssh_host": "must be reachable non-interactively (key auth). Test: ssh my-herdr-host true",
+    "tail_cmd": "advanced/testing: full argv that streams spool lines to stdout, replacing the built-in ssh+tail"
+  }
+}
