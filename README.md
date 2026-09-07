@@ -3,8 +3,7 @@
 A [Herdr](https://herdr.dev) plugin that speaks the selected terminal text aloud
 in a natural neural voice ([Piper](https://github.com/rhasspy/piper)).
 
-Select text → **Speak selection** (right-click) or your shortcut → hear it.
-A second shortcut stops playback.
+Select text, press your shortcut, hear it. A second shortcut stops playback.
 
 ## Install
 
@@ -22,11 +21,10 @@ that's your machine and you're done. For `herdr --remote`, see
 
 ## Use
 
-- **Right-click a selection → Speak selection** — works immediately, no config.
-  Passes the exact highlighted text.
-- **Keyboard shortcut** — Herdr plugins can't register keys themselves. Add this
-  to the `config.toml` of the machine running your Herdr **client**
-  (`~/.config/herdr/config.toml`):
+Herdr (0.8.x) invokes plugin actions only from **keybindings** — there's no
+right-click or menu entry. Herdr plugins also can't register keys themselves, so
+add this to the `config.toml` of the machine running your Herdr **client**
+(`~/.config/herdr/config.toml`):
 
   ```toml
   [[keys.command]]
@@ -44,10 +42,13 @@ that's your machine and you're done. For `herdr --remote`, see
 
   Then `herdr server reload-config` (or `prefix+shift+r`, or re-attach).
 
-  A keybound action doesn't get the selection from Herdr (0.8.x), so the shortcut
-  reads the **clipboard** instead — `copy_on_select = true` (the Herdr default)
-  keeps that equal to your last mouse selection. Needs `wl-clipboard` (Wayland)
-  or `xclip`/`xsel` (X11) on the server machine.
+  Herdr doesn't hand the selection to a keybound action (0.8.x — `selected_text`
+  in the invocation context is always empty), so the shortcut reads the
+  **clipboard** instead. `copy_on_select = true` (the Herdr default) keeps the
+  clipboard equal to your last mouse selection, so selecting then pressing the
+  key does the obvious thing. Needs `wl-clipboard` (Wayland) or `xclip`/`xsel`
+  (X11) on whichever machine plays the audio (the server for local `herdr`; the
+  companion's machine for `engine = "spool"`).
 
 ## Configure
 
@@ -70,12 +71,15 @@ Voices: <https://huggingface.co/rhasspy/piper-voices>. Try a few with
 
 ## Actions
 
-| action | id | contexts |
-|---|---|---|
-| Speak selection | `aktrov.herdr-tts.speak` | selection, global |
-| Stop speaking | `aktrov.herdr-tts.stop` | global |
-| Test TTS voice | `aktrov.herdr-tts.test` | workspace |
-| Herdr TTS setup (pane) | — | — |
+| action | id |
+|---|---|
+| Speak selection | `aktrov.herdr-tts.speak` |
+| Stop speaking | `aktrov.herdr-tts.stop` |
+| Test TTS voice | `aktrov.herdr-tts.test` |
+| Herdr TTS setup (pane) | — |
+
+Bind `speak`/`stop` to keys (above); run `test` from `herdr plugin action
+invoke aktrov.herdr-tts.test` or bind it too.
 
 ## Remote (`herdr --remote`)
 
@@ -103,7 +107,7 @@ machine's config by default, or attach with `--remote-keybindings server`.
 | Robotic voice | `engine` fell back to `spd-say` — open the setup pane to finish the Piper download |
 | Fast / chipmunk | a custom `player` is piping instead of taking a file path |
 | `prefix+t` does nothing | keybinding is on the wrong machine — see [Use](#use) / [Remote](#remote-herdr---remote) |
-| `prefix+t` speaks stale text | it reads the clipboard; re-select, or use right-click **Speak selection** |
+| `prefix+t` speaks stale text | it reads the clipboard; re-select (with `copy_on_select` on, that refreshes it) |
 
 ## Development
 

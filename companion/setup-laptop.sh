@@ -113,7 +113,6 @@ if ! command -v wl-paste >/dev/null 2>&1 \
   warn "No clipboard reader found. The keyboard shortcut reads the clipboard"
   warn "(herdr doesn't hand the selection to keybindings). Install one:"
   warn "  Wayland:  sudo apt install wl-clipboard      X11:  sudo apt install xclip"
-  warn "The right-click 'Speak selection' menu still works without it."
 fi
 
 # --- smoke test ------------------------------------------------------------

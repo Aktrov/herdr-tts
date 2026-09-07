@@ -1,8 +1,10 @@
 """Work out what text to speak.
 
-Right-click "Speak selection" gives us HERDR_PLUGIN_CONTEXT_JSON.selected_text.
-A keybinding does NOT (herdr 0.8.x) — so fall back to the clipboard, which
-`copy_on_select` keeps equal to the last mouse selection.
+Herdr 0.8.x doesn't put the selection in HERDR_PLUGIN_CONTEXT_JSON for a
+keybound action (`selected_text` is always empty), and there's no menu path.
+So we fall back to the clipboard, which `copy_on_select` keeps equal to the
+last mouse selection. `selected_text` is still read first in case a future
+Herdr populates it.
 """
 
 import json
@@ -54,7 +56,8 @@ def _truncate(text, max_chars):
 
 
 def from_context(max_chars=4000):
-    """Selection Herdr passed in the invocation context (right-click menu)."""
+    """Selection Herdr passed in the invocation context, if any (empty for a
+    keybound action on 0.8.x — kept for forward compatibility)."""
     text, source = _from_context()
     return _truncate(text, max_chars), source
 
