@@ -89,20 +89,66 @@ invoke aktrov.herdr-tts.test` or bind it too.
 ## Remote (`herdr --remote`)
 
 The plugin runs on the Herdr **server**; with `--remote` that's not the machine
-you're sitting at, so it can't reach your speakers. Two options:
+you're sitting at, so it can't reach your speakers. Herdr has no way to run
+anything on the client, so this side needs one small piece installed by hand —
+the **companion listener**. Full walkthrough:
 
-1. **Route audio over SSH** — set in `config.toml` on the server:
-   ```toml
-   engine = "command"
-   speak_command = ["ssh", "my-laptop", "spd-say"]   # or ["ssh", "my-mac", "say"]
-   ```
-2. **Companion listener** — set `engine = "spool"` (or leave `spool_fallback`
-   on) and run [`companion/herdr-tts-listend`](companion/) on your client
-   machine. It tails the plugin's `spool.jsonl` over SSH and plays locally with
-   Piper. See `companion/README` — this path is WIP.
+### On the server
 
-Also note: with `herdr --remote` the client reads keybindings from the **local**
-machine's config by default, or attach with `--remote-keybindings server`.
+```bash
+herdr plugin install Aktrov/herdr-tts
+```
+
+Then set the engine to `spool` so the plugin queues instead of trying to play
+locally — `herdr plugin config-dir aktrov.herdr-tts` prints the dir; put in its
+`config.toml`:
+
+```toml
+engine = "spool"
+```
+
+(A fully headless server with no audio tools spools automatically via
+`spool_fallback`; setting `engine = "spool"` is only needed when the server
+*has* `pw-play`/`paplay` but no usable output — otherwise it'd spawn a silent
+player.)
+
+### On your client machine
+
+```bash
+git clone https://github.com/Aktrov/herdr-tts
+herdr-tts/companion/setup-laptop.sh
+```
+
+That installs Piper + a voice, the `herdr-tts-listend` daemon, a
+`systemd --user` unit, and `~/.config/herdr-tts/config.json`. Edit that file:
+
+- `ssh_host` — your SSH alias for the server (must work non-interactively).
+- `remote_spool` — already defaults to
+  `~/.local/state/herdr/plugins/aktrov.herdr-tts/spool.jsonl`.
+
+Start it:
+
+```bash
+systemctl --user enable --now herdr-tts
+```
+
+Add the keybindings (from [`config/herdr-keys.snippet.toml`](config/herdr-keys.snippet.toml))
+to the **client's** `~/.config/herdr/config.toml` — with `herdr --remote` the
+client reads keybindings locally by default. (Or attach with
+`herdr --remote <host> --remote-keybindings server` and put them in the
+server's config instead.)
+
+Now select text on the server's panes, press `prefix+t`, and hear it on the
+client. `prefix+shift+s` stops.
+
+### Alternative: no companion, route over SSH
+
+If the server can SSH *into* the client, skip the companion:
+
+```toml
+engine = "command"
+speak_command = ["ssh", "my-laptop", "spd-say"]   # or ["ssh", "my-mac", "say"]
+```
 
 ## Troubleshooting
 

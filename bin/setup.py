@@ -77,10 +77,18 @@ def main():
     else:
         print("Skipped — setup did not complete.")
 
-    print("\n--- keyboard shortcut (optional) ---")
+    if load_config(config_dir).get("engine") == "spool":
+        print("\n--- companion listener ---")
+        print("engine = spool: this plugin only queues. On the machine you sit "
+              "at, install the listener that plays the audio:")
+        print("  git clone https://github.com/Aktrov/herdr-tts")
+        print("  herdr-tts/companion/setup-laptop.sh")
+        print("  systemctl --user enable --now herdr-tts")
+
+    print("\n--- keyboard shortcut ---")
     print("herdr can't self-register keys. Add this to the config.toml of the "
           "machine running your herdr *client*")
-    print("(for `herdr --remote`, that's the laptop; or attach with "
+    print("(for `herdr --remote`, that's the machine you sit at; or attach with "
           "--remote-keybindings server):\n")
     try:
         print(KEYS_SNIPPET.read_text())
