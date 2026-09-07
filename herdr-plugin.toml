@@ -11,7 +11,7 @@
 
 id = "aktrov.herdr-tts"
 name = "Herdr TTS"
-version = "0.2.3"
+version = "0.2.4"
 min_herdr_version = "0.8.0"
 description = "Speak the selected text (or clipboard) aloud in a natural neural voice — local Piper, spd-say, or any custom command"
 platforms = ["linux", "macos"]

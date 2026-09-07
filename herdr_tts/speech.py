@@ -99,11 +99,17 @@ def _kill(state_dir, name):
     return True
 
 
-def stop(state_dir, engine="piper"):
+def stop(state_dir, engine="piper", relay=False):
     killed = _kill(state_dir, "play.pid") | _kill(state_dir, "synth.pid")
-    log(state_dir, "stop: killed running audio" if killed else "stop: nothing running")
     if engine == "spd-say" and shutil.which("spd-say"):
         subprocess.run(["spd-say", "-C"], check=False)
+    relayed = spool_stop(state_dir) if relay else False
+    parts = []
+    if killed:
+        parts.append("killed local audio")
+    if relayed:
+        parts.append("queued stop for companion")
+    log(state_dir, "stop: " + (", ".join(parts) if parts else "nothing running"))
 
 
 # ---- players ---------------------------------------------------------------
@@ -136,17 +142,31 @@ def queue_clipboard(state_dir):
     _spool(state_dir, "", from_clipboard=True)
 
 
-def _spool(state_dir, text, from_clipboard=False):
-    rec = {"t": round(time.time(), 3), "cmd": "speak", "text": text,
-           "id": uuid.uuid4().hex[:12]}
-    if from_clipboard:
-        rec["from_clipboard"] = True
+def _spool_write(state_dir, rec):
     sp = Path(state_dir) / "spool.jsonl"
     with sp.open("a") as fh:
         fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     lines = sp.read_text(errors="replace").splitlines()
     if len(lines) > 200:
         sp.write_text("\n".join(lines[-200:]) + "\n")
+
+
+def _spool(state_dir, text, from_clipboard=False):
+    rec = {"t": round(time.time(), 3), "cmd": "speak", "text": text,
+           "id": uuid.uuid4().hex[:12]}
+    if from_clipboard:
+        rec["from_clipboard"] = True
+    _spool_write(state_dir, rec)
+
+
+def spool_stop(state_dir):
+    """Tell a companion listener to stop. No-op if nothing has spooled here."""
+    sp = Path(state_dir) / "spool.jsonl"
+    if not sp.exists():
+        return False
+    _spool_write(state_dir, {"t": round(time.time(), 3), "cmd": "stop",
+                             "id": uuid.uuid4().hex[:12]})
+    return True
 
 
 def _cache_dir(state_dir):

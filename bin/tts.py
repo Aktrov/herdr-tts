@@ -26,7 +26,8 @@ def main():
     cfg = load_config(config_dir)
 
     if action == "stop":
-        speech.stop(state_dir, cfg.get("engine", "piper"))
+        # relay=True also queues a stop for a companion listener (engine=spool)
+        speech.stop(state_dir, cfg.get("engine", "piper"), relay=True)
         return 0
 
     if action == "test":
