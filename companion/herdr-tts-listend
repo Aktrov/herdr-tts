@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import queue
+import shlex
 import shutil
 import signal
 import subprocess
@@ -57,9 +58,32 @@ CLIPBOARD_CANDIDATES = [
     ["pbpaste"],
 ]
 
-# Players are handed a real .wav FILE path (appended as the last arg), never a
-# pipe — piping a 22.05 kHz WAV into a player that assumes 48 kHz raw is what
-# makes it sound fast/chipmunk. A file lets every player read the real header.
+def _voice_sample_rate(voice_path, default=22050):
+    try:
+        meta = json.loads(Path(str(voice_path) + ".json").read_text())
+        return int(meta.get("audio", {}).get("sample_rate", default)) or default
+    except (OSError, ValueError, TypeError):
+        return default
+
+
+def _raw_player(sample_rate):
+    """A player that takes raw s16le mono on stdin — lets us stream Piper so
+    long text starts speaking immediately instead of after full synthesis."""
+    sr = int(sample_rate or 22050)
+    if shutil.which("pw-play"):
+        return ["pw-play", f"--rate={sr}", "--channels=1", "--format=s16", "-"]
+    if shutil.which("paplay"):
+        return ["paplay", "--raw", f"--rate={sr}", "--channels=1", "--format=s16le"]
+    if shutil.which("aplay"):
+        return ["aplay", "-q", "-t", "raw", "-f", "S16_LE", f"-r{sr}", "-c1", "-"]
+    if shutil.which("ffplay"):
+        return ["ffplay", "-hide_banner", "-loglevel", "error", "-autoexit",
+                "-nodisp", "-f", "s16le", "-ar", str(sr), "-ac", "1", "-i", "-"]
+    return None
+
+
+# Fallback file players are handed a real .wav path (never a pipe — piping a
+# 22 kHz WAV into a player that assumes 48 kHz is what makes it sound chipmunk).
 PLAYER_CANDIDATES = [
     ["paplay"],
     ["pw-play"],
@@ -203,26 +227,44 @@ class Speaker:
         if not (os.path.exists(pbin) and os.path.exists(voice)):
             log(f"piper missing: bin={pbin} voice={voice} — run setup-laptop.sh")
             return
-        if not self.player:
-            return
         wav = self._new_wav()
-        cmd = [pbin, "--model", voice, "--output_file", wav]
         ls = self.cfg.get("piper_length_scale")
-        if ls is not None:
-            cmd += ["--length_scale", str(ls)]
         espeak_data = os.path.join(os.path.dirname(pbin), "espeak-ng-data")
-        if os.path.isdir(espeak_data):
-            cmd += ["--espeak_data", espeak_data]
         env = dict(os.environ)
         env["LD_LIBRARY_PATH"] = (os.path.dirname(pbin) + os.pathsep
                                   + env.get("LD_LIBRARY_PATH", ""))
-        synth = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                 stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.PIPE,
+
+        base = [pbin, "--model", voice]
+        if ls is not None:
+            base += ["--length_scale", str(ls)]
+        if os.path.isdir(espeak_data):
+            base += ["--espeak_data", espeak_data]
+
+        # Stream Piper straight into a raw player: playback starts on the first
+        # chunk, so a long paragraph doesn't sit silent while it synthesizes.
+        raw = _raw_player(_voice_sample_rate(voice))
+        if raw:
+            pipeline = shlex.join(base + ["--output-raw"]) + " | " + shlex.join(raw)
+            proc = subprocess.Popen(["sh", "-c", pipeline], stdin=subprocess.PIPE,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    start_new_session=True, env=env)
+            try:
+                proc.stdin.write(text.encode("utf-8", "replace"))
+                proc.stdin.close()
+            except BrokenPipeError:
+                pass
+            self.procs = [proc]
+            return
+
+        if not self.player:
+            log("no audio player found (need pw-play / paplay / aplay / ffplay / mpv)")
+            return
+        synth = subprocess.Popen(base + ["--output_file", wav], stdin=subprocess.PIPE,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                  start_new_session=True, env=env)
         self.procs = [synth]
         try:
-            _, err = synth.communicate(text.encode("utf-8", "replace"), timeout=120)
+            _, err = synth.communicate(text.encode("utf-8", "replace"), timeout=180)
         except subprocess.TimeoutExpired:
             self.stop()
             log("piper timed out")
