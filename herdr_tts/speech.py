@@ -125,7 +125,7 @@ def _raw_player(sample_rate):
     """A player that takes raw s16le mono on stdin — lets us stream Piper."""
     sr = int(sample_rate or 22050)
     if shutil.which("pw-play"):
-        return ["pw-play", f"--rate={sr}", "--channels=1", "--format=s16", "-"]
+        return ["pw-play", "--raw", f"--rate={sr}", "--channels=1", "--format=s16", "-"]
     if shutil.which("paplay"):
         return ["paplay", "--raw", f"--rate={sr}", "--channels=1", "--format=s16le"]
     if shutil.which("aplay"):
